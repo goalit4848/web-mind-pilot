@@ -1,1 +1,4 @@
 project_id = "sgqiezqjbtnocunsorhu"
+
+[functions.web-agent]
+verify_jwt = false
