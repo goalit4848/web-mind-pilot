@@ -19,13 +19,18 @@ const Index = () => {
 
   const handleSend = async (message: string) => {
     // Add user message
-    setMessages(prev => [...prev, { role: "user", content: message }]);
+    const newUserMessage = { role: "user" as const, content: message };
+    const updatedMessages = [...messages, newUserMessage];
+    setMessages(updatedMessages);
     setIsProcessing(true);
     setAgentStatus("Starting browser session...");
 
     try {
+      // Send conversation history (last 3 turns = 6 messages max)
+      const conversationHistory = updatedMessages.slice(-6);
+      
       const { data, error } = await supabase.functions.invoke("web-agent", {
-        body: { command: message },
+        body: { messages: conversationHistory },
       });
 
       if (error) throw error;

@@ -12,8 +12,8 @@ serve(async (req) => {
   }
 
   try {
-    const { command } = await req.json();
-    console.log("Received command:", command);
+    const { messages } = await req.json();
+    console.log("Received messages:", messages);
 
     const BROWSERLESS_API_KEY = Deno.env.get('BROWSERLESS_API_KEY');
     const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
@@ -23,7 +23,7 @@ serve(async (req) => {
     }
 
     // Connect to Browserless and execute the agent loop
-    const result = await executeAgentLoop(command, BROWSERLESS_API_KEY, LOVABLE_API_KEY);
+    const result = await executeAgentLoop(messages, BROWSERLESS_API_KEY, LOVABLE_API_KEY);
 
     return new Response(JSON.stringify(result), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -38,8 +38,9 @@ serve(async (req) => {
   }
 });
 
-async function executeAgentLoop(goal: string, browserlessKey: string, lovableKey: string) {
-  console.log("Starting agent loop for goal:", goal);
+async function executeAgentLoop(messages: Array<{role: string, content: string}>, browserlessKey: string, lovableKey: string) {
+  const latestMessage = messages[messages.length - 1].content;
+  console.log("Starting agent loop with conversation history. Latest message:", latestMessage);
   
   // Use Browserless REST API for simpler implementation
   const browserlessUrl = `https://production-sfo.browserless.io/screenshot?token=${browserlessKey}`;
@@ -66,6 +67,12 @@ async function executeAgentLoop(goal: string, browserlessKey: string, lovableKey
   
   console.log("Captured initial screenshot");
 
+  // Build conversation history for context
+  const conversationContext = messages.slice(-6).map(msg => ({
+    role: msg.role === 'user' ? 'user' : 'assistant',
+    content: msg.content
+  }));
+
   // Use Gemini Pro for vision analysis
   const analysisResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
     method: 'POST',
@@ -78,14 +85,21 @@ async function executeAgentLoop(goal: string, browserlessKey: string, lovableKey
       messages: [
         {
           role: 'system',
-          content: 'You are a web automation agent. Analyze the screenshot and extract relevant information based on the user\'s goal. Be concise and specific.'
+          content: `You are a web automation agent that can see webpages and understand conversational context.
+
+IMPORTANT: Before analyzing the page, check the conversation history:
+- If the user's latest message is a confirmation (like "Yes", "Okay", "Please do that", "Go ahead", "Proceed"), they are confirming a previous plan or action you mentioned. In this case, acknowledge their confirmation and proceed with what you previously suggested.
+- If the user's message is a new, unrelated command or question, treat it as a fresh task.
+
+Your job is to analyze the screenshot and extract relevant information based on the user's goal, taking into account the conversation history. Be concise and specific.`
         },
+        ...conversationContext.slice(0, -1), // Include all but the latest message as history
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text: `Goal: ${goal}\n\nAnalyze this screenshot of http://quotes.toscrape.com/ and extract the information needed to accomplish the goal. Provide specific data you can see.`
+              text: `Current webpage: http://quotes.toscrape.com/\n\nLatest message: "${latestMessage}"\n\nAnalyze the screenshot and respond appropriately based on the conversation context. If this is a confirmation, acknowledge it and explain what you'll do next. If it's a new request, extract the information needed to accomplish it.`
             },
             {
               type: 'image_url',
@@ -123,11 +137,12 @@ async function executeAgentLoop(goal: string, browserlessKey: string, lovableKey
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful AI assistant. Convert technical data into a friendly, natural language response.'
+          content: 'You are a helpful AI assistant. Convert technical data into a friendly, natural language response while maintaining conversational context.'
         },
+        ...conversationContext.slice(-4), // Include recent context
         {
           role: 'user',
-          content: `The user asked: "${goal}"\n\nRaw data from the website:\n${rawResult}\n\nPlease provide a friendly, natural language summary of this information.`
+          content: `Based on the conversation above, the user's latest message was: "${latestMessage}"\n\nRaw analysis from the webpage:\n${rawResult}\n\nPlease provide a friendly, natural language response that takes into account the conversation history.`
         }
       ],
       max_tokens: 500,
