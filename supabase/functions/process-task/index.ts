@@ -123,10 +123,18 @@ async function executeAgentLoop(
   let isDone = false;
   let rawResult = '';
   let iterationCount = 0;
-  const MAX_ITERATIONS = 10;
+  const MAX_ITERATIONS = 15;
+  let previousAction: any = null;
+  let previousScreenshotHash = '';
 
-  while (!isDone && iterationCount < MAX_ITERATIONS) {
+  while (!isDone) {
     iterationCount++;
+    
+    // Safety check: Step limit
+    if (iterationCount > MAX_ITERATIONS) {
+      throw new Error('Agent exceeded the maximum step limit without completing the task');
+    }
+    
     console.log(`Iteration ${iterationCount}: Taking screenshot of ${currentUrl}`);
 
     // Update agent thought
@@ -154,6 +162,9 @@ async function executeAgentLoop(
 
     const screenshotBuffer = await screenshotResponse.arrayBuffer();
     const base64Screenshot = btoa(String.fromCharCode(...new Uint8Array(screenshotBuffer)));
+    
+    // Create a simple hash of the screenshot for comparison
+    const currentScreenshotHash = base64Screenshot.substring(0, 100);
 
     // Update agent thought
     await supabase
@@ -194,7 +205,8 @@ Action types:
 - scroll: Scroll the page
 - done: Goal achieved, provide the extracted data in raw_result
 
-Current iteration: ${iterationCount}/${MAX_ITERATIONS}`
+Current iteration: ${iterationCount}/${MAX_ITERATIONS}
+WARNING: You are approaching the step limit. Work efficiently to complete the goal.`
           },
           {
             role: 'user',
@@ -245,6 +257,17 @@ Current iteration: ${iterationCount}/${MAX_ITERATIONS}`
 
     // Execute the action
     const action = agentResponse.action;
+    
+    // Safety check: Repetition detection
+    if (previousAction && 
+        JSON.stringify(previousAction) === JSON.stringify(action) &&
+        previousScreenshotHash === currentScreenshotHash) {
+      throw new Error('Agent got stuck in a repetitive loop - same action with no page changes detected');
+    }
+    
+    // Update tracking variables
+    previousAction = { ...action };
+    previousScreenshotHash = currentScreenshotHash;
 
     if (action.type === 'done') {
       isDone = true;
