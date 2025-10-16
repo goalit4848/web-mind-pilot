@@ -118,8 +118,97 @@ async function executeAgentLoop(
 ) {
   console.log("Starting agent loop with prompt:", prompt);
   
+  // PHASE 1: URL EXTRACTION AND NAVIGATION
+  console.log("Phase 1: Extracting target URL from prompt");
+  await supabase
+    .from('tasks')
+    .update({ agent_thought: 'Analyzing prompt to find target website...' })
+    .eq('id', taskId);
+
+  const urlExtractionResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${lovableKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'google/gemini-2.5-flash',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a URL extraction assistant. Extract the target website URL from the user's request.
+Respond ONLY with a JSON object in this format:
+{
+  "url": "https://example.com",
+  "execution_goal": "The specific task to perform on this website, without navigation instructions"
+}
+
+If the prompt mentions a website like "eventbrite.com", return the full URL like "https://eventbrite.com".
+For the execution_goal, extract what the user wants to DO on that website, removing all navigation language.
+Example: "Go to eventbrite.com and search for tech conferences" -> execution_goal should be "search for tech conferences"`
+        },
+        {
+          role: 'user',
+          content: `Extract the target URL and execution goal from this request: "${prompt}"`
+        }
+      ],
+      max_tokens: 200,
+    }),
+  });
+
+  if (!urlExtractionResponse.ok) {
+    throw new Error('Failed to extract URL from prompt');
+  }
+
+  const urlData = await urlExtractionResponse.json();
+  let urlContent = urlData.choices[0].message.content;
+  
+  const urlJsonMatch = urlContent.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/) || 
+                       urlContent.match(/(\{[\s\S]*\})/);
+  
+  if (!urlJsonMatch) {
+    throw new Error('Could not parse URL from AI response');
+  }
+
+  const { url: targetUrl, execution_goal: executionGoal } = JSON.parse(urlJsonMatch[1]);
+  console.log("Extracted target URL:", targetUrl);
+  console.log("Execution goal:", executionGoal);
+
+  await supabase
+    .from('tasks')
+    .update({ agent_thought: `Navigating to ${targetUrl}...` })
+    .eq('id', taskId);
+
+  // Take initial screenshot of target URL
   const browserlessUrl = `https://production-sfo.browserless.io/screenshot?token=${browserlessKey}`;
-  let currentUrl = 'http://quotes.toscrape.com/';
+  const initialScreenshotResponse = await fetch(browserlessUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: targetUrl,
+      options: {
+        fullPage: false,
+        type: 'png',
+      },
+    }),
+  });
+
+  if (!initialScreenshotResponse.ok) {
+    throw new Error('Failed to navigate to target URL');
+  }
+
+  console.log("Successfully navigated to target URL");
+  await supabase
+    .from('tasks')
+    .update({ agent_thought: `Arrived at ${targetUrl}. Beginning task execution...` })
+    .eq('id', taskId);
+
+  // Small delay before starting execution phase
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  // PHASE 2: TASK EXECUTION
+  console.log("Phase 2: Starting task execution");
+  let currentUrl = targetUrl;
   let isDone = false;
   let rawResult = '';
   let iterationCount = 0;
@@ -182,24 +271,22 @@ async function executeAgentLoop(
       body: JSON.stringify({
         model: 'google/gemini-2.5-pro',
         messages: [
-          {
-            role: 'system',
-            content: `You are a web automation agent. Analyze the screenshot and determine the next action to achieve the user's goal.
+        {
+          role: 'system',
+          content: `You are a web automation agent. You have already navigated to the target website. Now analyze the screenshot and determine the next action to achieve the user's goal.
 
 IMPORTANT: Respond ONLY with a valid JSON object in this exact format:
 {
   "thought": "Your reasoning about what you see and what to do next",
   "action": {
-    "type": "navigate|click|type|scroll|done",
-    "url": "URL to navigate to (for navigate action)",
+    "type": "click|type|scroll|done",
     "selector": "CSS selector (for click/type actions)",
     "text": "Text to type (for type action)",
     "raw_result": "The extracted data (ONLY for done action)"
   }
 }
 
-Action types:
-- navigate: Go to a new URL
+Action types (NOTE: You are already on the correct page, do NOT use navigate):
 - click: Click an element (provide CSS selector)
 - type: Type text into an input (provide CSS selector and text)
 - scroll: Scroll the page
@@ -207,14 +294,14 @@ Action types:
 
 Current iteration: ${iterationCount}/${MAX_ITERATIONS}
 WARNING: You are approaching the step limit. Work efficiently to complete the goal.`
-          },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Current URL: ${currentUrl}\n\nUser's goal: "${prompt}"\n\nWhat should I do next? Respond with JSON only.`
-              },
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `You are currently on: ${currentUrl}\n\nYour task: "${executionGoal}"\n\nWhat should I do next? Respond with JSON only.`
+            },
               {
                 type: 'image_url',
                 image_url: {
@@ -273,9 +360,6 @@ WARNING: You are approaching the step limit. Work efficiently to complete the go
       isDone = true;
       rawResult = action.raw_result || '';
       console.log("Agent completed task with result:", rawResult);
-    } else if (action.type === 'navigate') {
-      currentUrl = action.url;
-      console.log("Navigating to:", currentUrl);
     } else if (action.type === 'click') {
       console.log("Would click:", action.selector);
       // Note: Browserless screenshot API doesn't support interactions
