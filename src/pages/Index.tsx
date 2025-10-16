@@ -17,6 +17,7 @@ interface Task {
   prompt: string;
   status: string;
   result: string | null;
+  agent_thought?: string | null;
   created_at: string;
 }
 
@@ -25,6 +26,7 @@ const Index = () => {
   const [agentStatus, setAgentStatus] = useState("Idle");
   const [isProcessing, setIsProcessing] = useState(false);
   const [userId, setUserId] = useState<string>("");
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const { toast } = useToast();
 
   // Generate or retrieve session ID for this user
@@ -36,6 +38,42 @@ const Index = () => {
     }
     setUserId(sessionId);
   }, []);
+
+  // Subscribe to real-time task updates for agent status
+  useEffect(() => {
+    if (!currentTaskId) return;
+
+    const channel = supabase
+      .channel('task-updates')
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'tasks',
+          filter: `id=eq.${currentTaskId}`
+        },
+        (payload) => {
+          const updatedTask = payload.new as Task;
+          if (updatedTask.agent_thought) {
+            setAgentStatus(updatedTask.agent_thought);
+          }
+          if (updatedTask.status === 'completed' || updatedTask.status === 'failed') {
+            setIsProcessing(false);
+            setCurrentTaskId(null);
+            if (updatedTask.result) {
+              setMessages(prev => [...prev, { role: "agent", content: updatedTask.result }]);
+            }
+            setAgentStatus("Idle");
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [currentTaskId]);
 
   const handleSend = async (message: string) => {
     if (!userId) return;
@@ -60,7 +98,8 @@ const Index = () => {
 
       if (insertError) throw insertError;
 
-      setAgentStatus("Task queued");
+      setCurrentTaskId(task.id);
+      setAgentStatus("Task queued, starting agent...");
       
       toast({
         title: "Task Created",
@@ -84,9 +123,8 @@ const Index = () => {
         variant: "destructive",
       });
       setAgentStatus("Error occurred");
-    } finally {
       setIsProcessing(false);
-      setTimeout(() => setAgentStatus("Idle"), 2000);
+      setCurrentTaskId(null);
     }
   };
 

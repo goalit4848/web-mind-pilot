@@ -16,6 +16,7 @@ export type Database = {
     Tables: {
       tasks: {
         Row: {
+          agent_thought: string | null
           created_at: string
           id: string
           prompt: string
@@ -24,6 +25,7 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          agent_thought?: string | null
           created_at?: string
           id?: string
           prompt: string
@@ -32,6 +34,7 @@ export type Database = {
           user_id: string
         }
         Update: {
+          agent_thought?: string | null
           created_at?: string
           id?: string
           prompt?: string
