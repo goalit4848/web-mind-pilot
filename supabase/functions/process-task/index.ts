@@ -116,13 +116,21 @@ async function executeAgentLoop(
   lovableKey: string,
   supabase: any
 ) {
-  console.log("Starting agent loop with prompt:", prompt);
+  console.log("Starting smart web automation for prompt:", prompt);
   
-  // PHASE 1: URL EXTRACTION AND NAVIGATION
+  // Track execution metadata
+  const executionLog = {
+    actions_taken: [] as string[],
+    url: '',
+    title: '',
+    screenshot_checks: [] as string[],
+  };
+  
+  // PHASE 1: URL EXTRACTION
   console.log("Phase 1: Extracting target URL from prompt");
   await supabase
     .from('tasks')
-    .update({ agent_thought: 'Analyzing prompt to find target website...' })
+    .update({ agent_thought: 'Analyzing your request...' })
     .eq('id', taskId);
 
   const urlExtractionResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
@@ -136,20 +144,15 @@ async function executeAgentLoop(
       messages: [
         {
           role: 'system',
-          content: `You are a URL extraction assistant. Extract the target website URL from the user's request.
-Respond ONLY with a JSON object in this format:
+          content: `Extract the target URL and task from the user's request. Respond ONLY with JSON:
 {
   "url": "https://example.com",
-  "execution_goal": "The specific task to perform on this website, without navigation instructions"
-}
-
-If the prompt mentions a website like "eventbrite.com", return the full URL like "https://eventbrite.com".
-For the execution_goal, extract what the user wants to DO on that website, removing all navigation language.
-Example: "Go to eventbrite.com and search for tech conferences" -> execution_goal should be "search for tech conferences"`
+  "task": "what to do on this website"
+}`
         },
         {
           role: 'user',
-          content: `Extract the target URL and execution goal from this request: "${prompt}"`
+          content: prompt
         }
       ],
       max_tokens: 200,
@@ -161,18 +164,17 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
   }
 
   const urlData = await urlExtractionResponse.json();
-  let urlContent = urlData.choices[0].message.content;
+  const urlContent = urlData.choices[0].message.content;
+  const urlMatch = urlContent.match(/\{[\s\S]*\}/);
   
-  const urlJsonMatch = urlContent.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/) || 
-                       urlContent.match(/(\{[\s\S]*\})/);
-  
-  if (!urlJsonMatch) {
-    throw new Error('Could not parse URL from AI response');
+  if (!urlMatch) {
+    throw new Error('Could not parse URL from response');
   }
 
-  const { url: targetUrl, execution_goal: executionGoal } = JSON.parse(urlJsonMatch[1]);
-  console.log("Extracted target URL:", targetUrl);
-  console.log("Execution goal:", executionGoal);
+  const { url: targetUrl, task: executionTask } = JSON.parse(urlMatch[0]);
+  console.log("Target URL:", targetUrl, "Task:", executionTask);
+  executionLog.url = targetUrl;
+  executionLog.actions_taken.push('analyzed_request');
 
   await supabase
     .from('tasks')
@@ -273,13 +275,20 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
 
     // Check for identical screenshots (page not loading or stuck)
     const currentScreenshotHash = base64Screenshot.substring(0, 200);
-    if (currentScreenshotHash === lastScreenshotHash) {
-      identicalScreenshotCount++;
-      console.log(`Identical screenshot detected (${identicalScreenshotCount}/3)`);
+    
+    // Detect if screenshot is likely black/empty (very low variation in first bytes)
+    const isLikelyBlack = base64Screenshot.substring(0, 500).split('').filter((c: string, i: number, arr: string[]) => 
+      i > 0 && c !== arr[i-1]
+    ).length < 10;
+    
+    if (isLikelyBlack) {
+      console.log('Screenshot appears black or empty');
+      executionLog.screenshot_checks.push('black');
       
-      if (identicalScreenshotCount >= 3) {
-        // Refresh page once and reset counter
-        console.log('Refreshing page due to identical screenshots');
+      if (identicalScreenshotCount >= 2) {
+        // Reload once and retry
+        console.log('Reloading page due to black screenshot');
+        executionLog.actions_taken.push('page_reload');
         await fetch(browserlessUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -287,7 +296,7 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
             code: `
               const browser = await puppeteer.launch();
               const page = await browser.newPage();
-              await page.goto("${pageInfo.url}", { waitUntil: 'networkidle2' });
+              await page.goto("${targetUrl}", { waitUntil: 'networkidle2' });
               await page.reload({ waitUntil: 'networkidle2' });
               await page.waitForTimeout(3000);
               await browser.close();
@@ -296,6 +305,40 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
         });
         identicalScreenshotCount = 0;
         lastScreenshotHash = '';
+        actionHistory = []; // Reset action history after reload
+        continue;
+      }
+      identicalScreenshotCount++;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      continue;
+    }
+    
+    if (currentScreenshotHash === lastScreenshotHash) {
+      identicalScreenshotCount++;
+      console.log(`Identical screenshot detected (${identicalScreenshotCount}/2)`);
+      executionLog.screenshot_checks.push('same');
+      
+      if (identicalScreenshotCount >= 2) {
+        // Reload once and reset counter
+        console.log('Reloading page due to identical screenshots');
+        executionLog.actions_taken.push('page_reload');
+        await fetch(browserlessUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: `
+              const browser = await puppeteer.launch();
+              const page = await browser.newPage();
+              await page.goto("${pageInfo.url || targetUrl}", { waitUntil: 'networkidle2' });
+              await page.reload({ waitUntil: 'networkidle2' });
+              await page.waitForTimeout(3000);
+              await browser.close();
+            `,
+          }),
+        });
+        identicalScreenshotCount = 0;
+        lastScreenshotHash = '';
+        actionHistory = []; // Reset action history after reload
         continue;
       }
       
@@ -307,6 +350,12 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
     
     lastScreenshotHash = currentScreenshotHash;
     identicalScreenshotCount = 0;
+    executionLog.screenshot_checks.push('ok');
+    
+    // Store page title if we haven't yet
+    if (!executionLog.title && pageInfo.title) {
+      executionLog.title = pageInfo.title;
+    }
 
     // Ask Gemini to analyze and determine next action
     await supabase
@@ -325,11 +374,11 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
         messages: [
           {
             role: 'system',
-            content: `You are a web automation agent. Analyze the screenshot and page info, then decide the next action.
+            content: `You are a smart web automation agent. Your job is to visit websites, interact naturally, and provide clear readable summaries.
 
-IMPORTANT: Respond ONLY with a valid JSON object:
+RESPOND ONLY with valid JSON in this format:
 {
-  "thought": "Your reasoning",
+  "description": "What you're about to do",
   "action": {
     "type": "click|type|scroll|done",
     "selector": "CSS selector (for click/type)",
@@ -338,21 +387,28 @@ IMPORTANT: Respond ONLY with a valid JSON object:
   }
 }
 
-Action types:
-- click: Click an element (provide CSS selector like "button", "input[type='text']", "#id", ".class")
-- type: Type text (provide selector and text)
+EXECUTION RULES:
+1. Always describe what you're about to do in "description"
+2. Before clicking/typing, verify the element exists on the page
+3. Never repeat the same action more than twice
+4. For searches: Find search input, type query, submit
+5. For reading: Extract title + first visible paragraph
+6. For search results: List top 3 result titles with brief descriptions
+7. If stuck or unclear, scroll once then mark as done with what you found
+
+ACTION TYPES:
+- click: Click button/link (provide CSS selector)
+- type: Type into input field (provide selector + text, will auto-submit)
 - scroll: Scroll down to load more content
-- done: Task completed - provide a clear, human-readable summary
+- done: Task complete - provide human-readable summary
 
-CRITICAL RULES:
-1. For searches: Find the search input box and type the query
-2. For reading: Extract the page title and first paragraph
-3. For search results: List the top 3 result titles
-4. Never repeat the same action twice unless the page changes
-5. If stuck, try scrolling or mark as done with what you found
-6. Always return human-readable summaries, not raw HTML
+OUTPUT REQUIREMENTS:
+- Summary must be conversational and clear
+- List results as bullet points when applicable
+- Never output raw HTML or code
+- If can't find info, say so clearly
 
-You are on step ${iterationCount}/${MAX_ITERATIONS}. Work efficiently.`
+Step ${iterationCount}/${MAX_ITERATIONS}. Work efficiently and avoid loops.`
           },
           {
             role: 'user',
@@ -361,7 +417,7 @@ You are on step ${iterationCount}/${MAX_ITERATIONS}. Work efficiently.`
                 type: 'text',
                 text: `Current URL: ${pageInfo.url}
 Title: ${pageInfo.title}
-Task: "${executionGoal}"
+Task: "${executionTask}"
 
 Page text preview: ${pageInfo.bodyText}
 
@@ -398,21 +454,31 @@ What should I do next?`
     }
 
     const agentResponse = JSON.parse(jsonMatch[1]);
-    console.log("Agent decision:", agentResponse);
+    const description = agentResponse.description || agentResponse.thought || 'Processing...';
+    console.log("Agent description:", description);
+    console.log("Agent action:", agentResponse.action);
 
+    // Update agent thought with description
     await supabase
       .from('tasks')
-      .update({ agent_thought: agentResponse.thought })
+      .update({ agent_thought: description })
       .eq('id', taskId);
 
     const action = agentResponse.action;
     
-    // Check for repetitive actions
+    // Check for repetitive actions (max 2 times)
     if (previousAction && 
         JSON.stringify(previousAction) === JSON.stringify(action)) {
-      console.log('Same action repeated, marking as done');
+      console.log('Same action repeated twice, marking as done');
       isDone = true;
-      rawResult = action.summary || 'Task completed but agent got stuck repeating actions';
+      rawResult = JSON.stringify({
+        status: 'success',
+        url: pageInfo.url,
+        title: pageInfo.title || executionLog.title,
+        summary: action.summary || 'Task completed with available information',
+        actions_taken: executionLog.actions_taken,
+        screenshot_check: 'ok'
+      });
       break;
     }
     
@@ -421,14 +487,23 @@ What should I do next?`
     // Execute action
     if (action.type === 'done') {
       isDone = true;
-      rawResult = action.summary || '';
-      console.log("Task completed:", rawResult);
+      executionLog.actions_taken.push('completed');
+      rawResult = JSON.stringify({
+        status: 'success',
+        url: pageInfo.url,
+        title: pageInfo.title || executionLog.title,
+        summary: action.summary || 'Task completed',
+        actions_taken: executionLog.actions_taken,
+        screenshot_check: executionLog.screenshot_checks[executionLog.screenshot_checks.length - 1] || 'ok'
+      });
+      console.log("Task completed with result:", rawResult);
     } else {
       // Add action to history for replay on next iteration
       let actionCode = '';
       
       if (action.type === 'click') {
-        console.log("Clicking:", action.selector);
+        console.log("Planning to click:", action.selector);
+        executionLog.actions_taken.push(`clicked:${action.selector}`);
         const safeSelector = action.selector.replace(/'/g, "\\'");
         actionCode = `
         console.log("Clicking: ${safeSelector}");
@@ -440,9 +515,10 @@ What should I do next?`
           console.log("Click failed, continuing:", e.message);
         }`;
       } else if (action.type === 'type') {
-        console.log("Typing:", action.text, "into", action.selector);
+        console.log("Planning to type:", action.text, "into", action.selector);
+        executionLog.actions_taken.push(`typed:${action.text.substring(0, 20)}`);
         const safeSelector = action.selector.replace(/'/g, "\\'");
-        const safeText = action.text.replace(/'/g, "\\'").replace(/\n/g, '\\n');
+        const safeText = (action.text || '').replace(/'/g, "\\'").replace(/\n/g, '\\n');
         actionCode = `
         console.log("Typing into: ${safeSelector}");
         try {
@@ -450,12 +526,13 @@ What should I do next?`
           await page.click('${safeSelector}'); // Focus the input
           await page.type('${safeSelector}', '${safeText}');
           await page.keyboard.press('Enter'); // Submit the form
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(3000); // Wait for results
         } catch (e) {
           console.log("Type failed, continuing:", e.message);
         }`;
       } else if (action.type === 'scroll') {
-        console.log("Scrolling page");
+        console.log("Planning to scroll page");
+        executionLog.actions_taken.push('scrolled');
         actionCode = `
         console.log("Scrolling page");
         await page.evaluate(() => window.scrollBy(0, 500));
@@ -473,17 +550,51 @@ What should I do next?`
   }
 
   if (!isDone) {
-    throw new Error('Agent reached maximum iterations without completing the task');
+    // Return structured error JSON
+    const errorResult = JSON.stringify({
+      status: 'error',
+      url: executionLog.url,
+      title: executionLog.title,
+      summary: 'The task could not be completed within the step limit. The page may be too complex or the task unclear.',
+      actions_taken: executionLog.actions_taken,
+      screenshot_check: executionLog.screenshot_checks[executionLog.screenshot_checks.length - 1] || 'unknown'
+    });
+    throw new Error(errorResult);
   }
 
-  if (!rawResult || rawResult.trim() === '') {
-    throw new Error('I was able to visit the page, but I could not find the specific information you asked for.');
+  // Parse and validate the result
+  let resultData;
+  try {
+    resultData = JSON.parse(rawResult);
+  } catch (e) {
+    // If rawResult is not JSON, wrap it
+    resultData = {
+      status: 'success',
+      url: executionLog.url,
+      title: executionLog.title,
+      summary: rawResult,
+      actions_taken: executionLog.actions_taken,
+      screenshot_check: 'ok'
+    };
+    rawResult = JSON.stringify(resultData);
   }
 
-  // Final summarization
+  if (!resultData.summary || resultData.summary.trim() === '') {
+    const errorResult = JSON.stringify({
+      status: 'error',
+      url: executionLog.url,
+      title: executionLog.title,
+      summary: 'I was able to visit the page, but could not find the specific information you requested.',
+      actions_taken: executionLog.actions_taken,
+      screenshot_check: resultData.screenshot_check || 'ok'
+    });
+    throw new Error(errorResult);
+  }
+
+  // Final summarization - convert JSON result to friendly text
   await supabase
     .from('tasks')
-    .update({ agent_thought: 'Generating final summary...' })
+    .update({ agent_thought: 'Formatting final response...' })
     .eq('id', taskId);
 
   const summaryResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
@@ -497,11 +608,11 @@ What should I do next?`
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful AI assistant. Convert the extracted data into a clear, friendly response.'
+          content: 'You are a helpful AI assistant. Convert the structured data into a clear, conversational response. Keep it brief and friendly.'
         },
         {
           role: 'user',
-          content: `User requested: "${prompt}"\n\nExtracted data:\n${JSON.stringify(rawResult)}\n\nProvide a friendly, natural language response.`
+          content: `User requested: "${prompt}"\n\nResult data:\n${rawResult}\n\nProvide a friendly, natural language summary.`
         }
       ],
       max_tokens: 500,
@@ -509,13 +620,14 @@ What should I do next?`
   });
 
   if (!summaryResponse.ok) {
-    throw new Error('Failed to generate summary');
+    // If summarization fails, return the JSON summary directly
+    return { summary: resultData.summary, rawResult };
   }
 
   const summaryData = await summaryResponse.json();
   const summary = summaryData.choices[0].message.content;
 
-  console.log("Summary generated:", summary);
+  console.log("Final summary generated:", summary);
 
   return { summary, rawResult };
 }
