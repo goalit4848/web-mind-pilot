@@ -116,21 +116,13 @@ async function executeAgentLoop(
   lovableKey: string,
   supabase: any
 ) {
-  console.log("Starting smart web automation for prompt:", prompt);
-  
-  // Track execution metadata
-  const executionLog = {
-    actions_taken: [] as string[],
-    url: '',
-    title: '',
-    screenshot_checks: [] as string[],
-  };
+  console.log("Starting simple web automation for prompt:", prompt);
   
   // PHASE 1: URL EXTRACTION
   console.log("Phase 1: Extracting target URL from prompt");
   await supabase
     .from('tasks')
-    .update({ agent_thought: 'Analyzing your request...' })
+    .update({ agent_thought: 'Understanding your request...' })
     .eq('id', taskId);
 
   const urlExtractionResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
@@ -160,7 +152,10 @@ async function executeAgentLoop(
   });
 
   if (!urlExtractionResponse.ok) {
-    throw new Error('Failed to extract URL from prompt');
+    return { 
+      summary: "I couldn't understand the URL from your request. Please specify a valid website like google.com or example.com.",
+      rawResult: null
+    };
   }
 
   const urlData = await urlExtractionResponse.json();
@@ -168,466 +163,208 @@ async function executeAgentLoop(
   const urlMatch = urlContent.match(/\{[\s\S]*\}/);
   
   if (!urlMatch) {
-    throw new Error('Could not parse URL from response');
+    return { 
+      summary: "I couldn't parse the website URL from your request. Please specify a clear URL.",
+      rawResult: null
+    };
   }
 
   const { url: targetUrl, task: executionTask } = JSON.parse(urlMatch[0]);
   console.log("Target URL:", targetUrl, "Task:", executionTask);
-  executionLog.url = targetUrl;
-  executionLog.actions_taken.push('analyzed_request');
 
   await supabase
     .from('tasks')
-    .update({ agent_thought: `Navigating to ${targetUrl}...` })
+    .update({ agent_thought: `Visiting ${targetUrl}...` })
     .eq('id', taskId);
 
-  // PHASE 2: TASK EXECUTION WITH PUPPETEER
-  console.log("Phase 2: Starting browser automation");
+  // PHASE 2: VISIT AND READ THE PAGE
+  console.log("Phase 2: Visiting the page");
   
-  let isDone = false;
-  let rawResult = '';
-  let iterationCount = 0;
-  const MAX_ITERATIONS = 15;
-  let previousAction: any = null;
-  let identicalScreenshotCount = 0;
-  let lastScreenshotHash = '';
-  let currentUrl = targetUrl; // Track current page URL
-  let actionHistory: string[] = []; // Track all actions taken
-
-  // Build Puppeteer script for browser automation
   const browserlessUrl = `https://production-sfo.browserless.io/chrome?token=${browserlessKey}`;
 
-  while (!isDone && iterationCount < MAX_ITERATIONS) {
-    iterationCount++;
-    console.log(`Iteration ${iterationCount}/${MAX_ITERATIONS}`);
-
-    await supabase
-      .from('tasks')
-      .update({ agent_thought: `Step ${iterationCount}: Analyzing page...` })
-      .eq('id', taskId);
-
-    // Build script to replay all actions and capture current state
-    const stateScript = `
-      const browser = await puppeteer.launch();
-      const page = await browser.newPage();
-      await page.setViewport({ width: 1280, height: 720 });
+  // Simple script: navigate, wait, screenshot, extract text
+  const visitScript = `
+    const browser = await puppeteer.launch();
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 720 });
+    
+    try {
+      console.log("Navigating to ${targetUrl}");
+      await page.goto("${targetUrl}", { waitUntil: 'networkidle2', timeout: 30000 });
       
-      try {
-        console.log("Navigating to ${targetUrl}");
-        await page.goto("${targetUrl}", { waitUntil: 'networkidle2', timeout: 30000 });
-        await page.waitForTimeout(3000); // Wait for page to render
-        
-        // Replay all previous actions to restore state
-        ${actionHistory.map(action => action).join('\n        ')}
-        
-        // Get current page info
-        const pageInfo = await page.evaluate(() => ({
-          url: window.location.href,
-          title: document.title,
-          bodyText: document.body?.innerText?.substring(0, 500) || ''
-        }));
-        
-        // Take screenshot
-        const screenshot = await page.screenshot({ 
-          type: 'png',
-          fullPage: false 
-        });
-        
-        await browser.close();
+      // Wait 3 seconds for page to fully render
+      await page.waitForTimeout(3000);
+      
+      // Get page info
+      const pageInfo = await page.evaluate(() => {
+        // Extract visible text from the page
+        const getVisibleText = () => {
+          const bodyText = document.body?.innerText || '';
+          const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+            .map(h => h.textContent?.trim())
+            .filter(t => t)
+            .slice(0, 5);
+          
+          return {
+            title: document.title,
+            headings: headings,
+            firstParagraph: bodyText.split('\\n').filter(line => line.length > 50)[0] || bodyText.substring(0, 300),
+            fullText: bodyText.substring(0, 2000)
+          };
+        };
         
         return {
-          screenshot: screenshot.toString('base64'),
-          pageInfo
+          url: window.location.href,
+          ...getVisibleText()
         };
-      } catch (error) {
-        console.error("Script error:", error);
-        await browser.close();
-        throw error;
-      }
-    `;
+      });
+      
+      // Take screenshot
+      const screenshot = await page.screenshot({ 
+        type: 'png',
+        fullPage: false 
+      });
+      
+      await browser.close();
+      
+      return {
+        screenshot: screenshot.toString('base64'),
+        pageInfo
+      };
+    } catch (error) {
+      console.error("Navigation error:", error);
+      await browser.close();
+      throw error;
+    }
+  `;
 
-    const scriptResponse = await fetch(browserlessUrl, {
+  let scriptResponse;
+  try {
+    scriptResponse = await fetch(browserlessUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        code: stateScript,
-      }),
+      body: JSON.stringify({ code: visitScript }),
     });
-
-    if (!scriptResponse.ok) {
-      const errorText = await scriptResponse.text();
-      console.error('Browserless error:', errorText);
-      
-      // If first navigation fails, try one more time
-      if (iterationCount === 1) {
-        console.log('Retrying navigation...');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        continue;
-      }
-      throw new Error('Failed to execute browser automation');
-    }
-
-    const scriptResult = await scriptResponse.json();
-    const base64Screenshot = scriptResult.screenshot;
-    const pageInfo = scriptResult.pageInfo;
-    
-    console.log('Page info:', pageInfo);
-
-    // Check for identical screenshots (page not loading or stuck)
-    const currentScreenshotHash = base64Screenshot.substring(0, 200);
-    
-    // Detect if screenshot is likely black/empty (very low variation in first bytes)
-    const isLikelyBlack = base64Screenshot.substring(0, 500).split('').filter((c: string, i: number, arr: string[]) => 
-      i > 0 && c !== arr[i-1]
-    ).length < 10;
-    
-    if (isLikelyBlack) {
-      console.log('Screenshot appears black or empty');
-      executionLog.screenshot_checks.push('black');
-      
-      if (identicalScreenshotCount >= 2) {
-        // Reload once and retry
-        console.log('Reloading page due to black screenshot');
-        executionLog.actions_taken.push('page_reload');
-        await fetch(browserlessUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            code: `
-              const browser = await puppeteer.launch();
-              const page = await browser.newPage();
-              await page.goto("${targetUrl}", { waitUntil: 'networkidle2' });
-              await page.reload({ waitUntil: 'networkidle2' });
-              await page.waitForTimeout(3000);
-              await browser.close();
-            `,
-          }),
-        });
-        identicalScreenshotCount = 0;
-        lastScreenshotHash = '';
-        actionHistory = []; // Reset action history after reload
-        continue;
-      }
-      identicalScreenshotCount++;
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      continue;
-    }
-    
-    if (currentScreenshotHash === lastScreenshotHash) {
-      identicalScreenshotCount++;
-      console.log(`Identical screenshot detected (${identicalScreenshotCount}/2)`);
-      executionLog.screenshot_checks.push('same');
-      
-      if (identicalScreenshotCount >= 2) {
-        // Reload once and reset counter
-        console.log('Reloading page due to identical screenshots');
-        executionLog.actions_taken.push('page_reload');
-        await fetch(browserlessUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            code: `
-              const browser = await puppeteer.launch();
-              const page = await browser.newPage();
-              await page.goto("${pageInfo.url || targetUrl}", { waitUntil: 'networkidle2' });
-              await page.reload({ waitUntil: 'networkidle2' });
-              await page.waitForTimeout(3000);
-              await browser.close();
-            `,
-          }),
-        });
-        identicalScreenshotCount = 0;
-        lastScreenshotHash = '';
-        actionHistory = []; // Reset action history after reload
-        continue;
-      }
-      
-      // Wait and retry
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      lastScreenshotHash = currentScreenshotHash;
-      continue;
-    }
-    
-    lastScreenshotHash = currentScreenshotHash;
-    identicalScreenshotCount = 0;
-    executionLog.screenshot_checks.push('ok');
-    
-    // Store page title if we haven't yet
-    if (!executionLog.title && pageInfo.title) {
-      executionLog.title = pageInfo.title;
-    }
-
-    // Ask Gemini to analyze and determine next action
-    await supabase
-      .from('tasks')
-      .update({ agent_thought: 'Analyzing page and planning next action...' })
-      .eq('id', taskId);
-
-    const analysisResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${lovableKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemini-2.5-pro',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a smart web automation agent. Your job is to visit websites, interact naturally, and provide clear readable summaries.
-
-RESPOND ONLY with valid JSON in this format:
-{
-  "description": "What you're about to do",
-  "action": {
-    "type": "click|type|scroll|done",
-    "selector": "CSS selector (for click/type)",
-    "text": "Text to type (for type action)",
-    "summary": "Human-readable summary (for done action)"
-  }
-}
-
-EXECUTION RULES:
-1. Always describe what you're about to do in "description"
-2. Before clicking/typing, verify the element exists on the page
-3. Never repeat the same action more than twice
-4. For searches: Find search input, type query, submit
-5. For reading: Extract title + first visible paragraph
-6. For search results: List top 3 result titles with brief descriptions
-7. If stuck or unclear, scroll once then mark as done with what you found
-
-ACTION TYPES:
-- click: Click button/link (provide CSS selector)
-- type: Type into input field (provide selector + text, will auto-submit)
-- scroll: Scroll down to load more content
-- done: Task complete - provide human-readable summary
-
-OUTPUT REQUIREMENTS:
-- Summary must be conversational and clear
-- List results as bullet points when applicable
-- Never output raw HTML or code
-- If can't find info, say so clearly
-
-Step ${iterationCount}/${MAX_ITERATIONS}. Work efficiently and avoid loops.`
-          },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Current URL: ${pageInfo.url}
-Title: ${pageInfo.title}
-Task: "${executionTask}"
-
-Page text preview: ${pageInfo.bodyText}
-
-What should I do next?`
-              },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/png;base64,${base64Screenshot}`
-                }
-              }
-            ]
-          }
-        ],
-        max_tokens: 1000,
-      }),
-    });
-
-    if (!analysisResponse.ok) {
-      const errorText = await analysisResponse.text();
-      console.error('Gemini API error:', errorText);
-      throw new Error('Failed to analyze page');
-    }
-
-    const analysisData = await analysisResponse.json();
-    let responseContent = analysisData.choices[0].message.content;
-
-    const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/) || 
-                     responseContent.match(/(\{[\s\S]*\})/);
-    
-    if (!jsonMatch) {
-      console.error('Invalid response:', responseContent);
-      throw new Error('Agent returned invalid response');
-    }
-
-    const agentResponse = JSON.parse(jsonMatch[1]);
-    const description = agentResponse.description || agentResponse.thought || 'Processing...';
-    console.log("Agent description:", description);
-    console.log("Agent action:", agentResponse.action);
-
-    // Update agent thought with description
-    await supabase
-      .from('tasks')
-      .update({ agent_thought: description })
-      .eq('id', taskId);
-
-    const action = agentResponse.action;
-    
-    // Check for repetitive actions (max 2 times)
-    if (previousAction && 
-        JSON.stringify(previousAction) === JSON.stringify(action)) {
-      console.log('Same action repeated twice, marking as done');
-      isDone = true;
-      rawResult = JSON.stringify({
-        status: 'success',
-        url: pageInfo.url,
-        title: pageInfo.title || executionLog.title,
-        summary: action.summary || 'Task completed with available information',
-        actions_taken: executionLog.actions_taken,
-        screenshot_check: 'ok'
-      });
-      break;
-    }
-    
-    previousAction = { ...action };
-
-    // Execute action
-    if (action.type === 'done') {
-      isDone = true;
-      executionLog.actions_taken.push('completed');
-      rawResult = JSON.stringify({
-        status: 'success',
-        url: pageInfo.url,
-        title: pageInfo.title || executionLog.title,
-        summary: action.summary || 'Task completed',
-        actions_taken: executionLog.actions_taken,
-        screenshot_check: executionLog.screenshot_checks[executionLog.screenshot_checks.length - 1] || 'ok'
-      });
-      console.log("Task completed with result:", rawResult);
-    } else {
-      // Add action to history for replay on next iteration
-      let actionCode = '';
-      
-      if (action.type === 'click') {
-        console.log("Planning to click:", action.selector);
-        executionLog.actions_taken.push(`clicked:${action.selector}`);
-        const safeSelector = action.selector.replace(/'/g, "\\'");
-        actionCode = `
-        console.log("Clicking: ${safeSelector}");
-        try {
-          await page.waitForSelector('${safeSelector}', { timeout: 10000 });
-          await page.click('${safeSelector}');
-          await page.waitForTimeout(2000);
-        } catch (e) {
-          console.log("Click failed, continuing:", e.message);
-        }`;
-      } else if (action.type === 'type') {
-        console.log("Planning to type:", action.text, "into", action.selector);
-        executionLog.actions_taken.push(`typed:${action.text.substring(0, 20)}`);
-        const safeSelector = action.selector.replace(/'/g, "\\'");
-        const safeText = (action.text || '').replace(/'/g, "\\'").replace(/\n/g, '\\n');
-        actionCode = `
-        console.log("Typing into: ${safeSelector}");
-        try {
-          await page.waitForSelector('${safeSelector}', { timeout: 10000 });
-          await page.click('${safeSelector}'); // Focus the input
-          await page.type('${safeSelector}', '${safeText}');
-          await page.keyboard.press('Enter'); // Submit the form
-          await page.waitForTimeout(3000); // Wait for results
-        } catch (e) {
-          console.log("Type failed, continuing:", e.message);
-        }`;
-      } else if (action.type === 'scroll') {
-        console.log("Planning to scroll page");
-        executionLog.actions_taken.push('scrolled');
-        actionCode = `
-        console.log("Scrolling page");
-        await page.evaluate(() => window.scrollBy(0, 500));
-        await page.waitForTimeout(1000);`;
-      }
-
-      if (actionCode) {
-        actionHistory.push(actionCode);
-        currentUrl = pageInfo.url; // Update current URL
-      }
-    }
-
-    // Small delay between iterations
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-
-  if (!isDone) {
-    // Return structured error JSON
-    const errorResult = JSON.stringify({
-      status: 'error',
-      url: executionLog.url,
-      title: executionLog.title,
-      summary: 'The task could not be completed within the step limit. The page may be too complex or the task unclear.',
-      actions_taken: executionLog.actions_taken,
-      screenshot_check: executionLog.screenshot_checks[executionLog.screenshot_checks.length - 1] || 'unknown'
-    });
-    throw new Error(errorResult);
-  }
-
-  // Parse and validate the result
-  let resultData;
-  try {
-    resultData = JSON.parse(rawResult);
-  } catch (e) {
-    // If rawResult is not JSON, wrap it
-    resultData = {
-      status: 'success',
-      url: executionLog.url,
-      title: executionLog.title,
-      summary: rawResult,
-      actions_taken: executionLog.actions_taken,
-      screenshot_check: 'ok'
+  } catch (error) {
+    console.error('Browserless fetch error:', error);
+    return { 
+      summary: "The page didn't load correctly. The website may be down or unreachable.",
+      rawResult: null
     };
-    rawResult = JSON.stringify(resultData);
   }
 
-  if (!resultData.summary || resultData.summary.trim() === '') {
-    const errorResult = JSON.stringify({
-      status: 'error',
-      url: executionLog.url,
-      title: executionLog.title,
-      summary: 'I was able to visit the page, but could not find the specific information you requested.',
-      actions_taken: executionLog.actions_taken,
-      screenshot_check: resultData.screenshot_check || 'ok'
-    });
-    throw new Error(errorResult);
+  if (!scriptResponse.ok) {
+    const errorText = await scriptResponse.text();
+    console.error('Browserless error:', errorText);
+    return { 
+      summary: "The page didn't load correctly. The website may have blocked the request or timed out.",
+      rawResult: null
+    };
   }
 
-  // Final summarization - convert JSON result to friendly text
+  const scriptResult = await scriptResponse.json();
+  const base64Screenshot = scriptResult.screenshot;
+  const pageInfo = scriptResult.pageInfo;
+  
+  console.log('Page loaded successfully:', pageInfo.title);
+
+  // Check if screenshot is likely black/empty
+  const isLikelyBlack = base64Screenshot.substring(0, 500).split('').filter((c: string, i: number, arr: string[]) => 
+    i > 0 && c !== arr[i-1]
+  ).length < 10;
+  
+  if (isLikelyBlack) {
+    console.log('Screenshot appears black or empty');
+    return { 
+      summary: "The page didn't load correctly. I could navigate to it, but the content didn't render properly.",
+      rawResult: null
+    };
+  }
+
+  // PHASE 3: ANALYZE AND SUMMARIZE
   await supabase
     .from('tasks')
-    .update({ agent_thought: 'Formatting final response...' })
+    .update({ agent_thought: 'Reading the page content...' })
     .eq('id', taskId);
 
-  const summaryResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+  const analysisResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${lovableKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'google/gemini-2.5-flash',
+      model: 'google/gemini-2.5-pro',
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful AI assistant. Convert the structured data into a clear, conversational response. Keep it brief and friendly.'
+          content: `You are a web automation assistant. Your job is to read websites and summarize what you see in plain, human-readable language.
+
+RULES:
+- Write like a human would describe what they see
+- For regular pages: mention the title and main content
+- For search results: list the top 3-5 results with brief descriptions
+- Never output JSON, code, or HTML
+- Keep it conversational and clear
+- If the page is blank or unclear, say "The page didn't load correctly"
+
+EXAMPLES:
+User asked to visit example.com:
+"The page is titled 'Example Domain.' It explains that this domain is for use in illustrative examples in documents."
+
+User asked to search Google for "AI tools":
+"I visited Google and searched for AI tools. Here are the top results:
+• FutureTools - A collection of the best AI tools and software
+• Product Hunt AI - New AI tools and products
+• OpenAI - The creators of ChatGPT and GPT-4"`
         },
         {
           role: 'user',
-          content: `User requested: "${prompt}"\n\nResult data:\n${rawResult}\n\nProvide a friendly, natural language summary.`
+          content: [
+            {
+              type: 'text',
+              text: `User asked: "${prompt}"
+
+I visited: ${pageInfo.url}
+Page title: ${pageInfo.title}
+Main headings: ${pageInfo.headings.join(', ')}
+First paragraph: ${pageInfo.firstParagraph}
+
+Full page text preview:
+${pageInfo.fullText}
+
+Please provide a clear, human-readable summary of what you found.`
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/png;base64,${base64Screenshot}`
+              }
+            }
+          ]
         }
       ],
       max_tokens: 500,
     }),
   });
 
-  if (!summaryResponse.ok) {
-    // If summarization fails, return the JSON summary directly
-    return { summary: resultData.summary, rawResult };
+  if (!analysisResponse.ok) {
+    const errorText = await analysisResponse.text();
+    console.error('Gemini API error:', errorText);
+    // Fallback to basic summary
+    return {
+      summary: `I visited ${pageInfo.title || targetUrl}. ${pageInfo.firstParagraph}`,
+      rawResult: JSON.stringify(pageInfo)
+    };
   }
 
-  const summaryData = await summaryResponse.json();
-  const summary = summaryData.choices[0].message.content;
+  const analysisData = await analysisResponse.json();
+  const summary = analysisData.choices[0].message.content;
 
-  console.log("Final summary generated:", summary);
+  console.log("Summary generated:", summary);
 
-  return { summary, rawResult };
+  return { 
+    summary, 
+    rawResult: JSON.stringify(pageInfo) 
+  };
 }
