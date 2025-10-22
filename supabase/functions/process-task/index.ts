@@ -179,89 +179,141 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
     .update({ agent_thought: `Navigating to ${targetUrl}...` })
     .eq('id', taskId);
 
-  // Take initial screenshot of target URL
-  const browserlessUrl = `https://production-sfo.browserless.io/screenshot?token=${browserlessKey}`;
-  const initialScreenshotResponse = await fetch(browserlessUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url: targetUrl,
-      options: {
-        fullPage: false,
-        type: 'png',
-      },
-    }),
-  });
-
-  if (!initialScreenshotResponse.ok) {
-    throw new Error('Failed to navigate to target URL');
-  }
-
-  console.log("Successfully navigated to target URL");
-  await supabase
-    .from('tasks')
-    .update({ agent_thought: `Arrived at ${targetUrl}. Beginning task execution...` })
-    .eq('id', taskId);
-
-  // Small delay before starting execution phase
-  await new Promise(resolve => setTimeout(resolve, 1000));
-
-  // PHASE 2: TASK EXECUTION
-  console.log("Phase 2: Starting task execution");
-  let currentUrl = targetUrl;
+  // PHASE 2: TASK EXECUTION WITH PUPPETEER
+  console.log("Phase 2: Starting browser automation");
+  
   let isDone = false;
   let rawResult = '';
   let iterationCount = 0;
   const MAX_ITERATIONS = 15;
   let previousAction: any = null;
-  let previousScreenshotHash = '';
+  let identicalScreenshotCount = 0;
+  let lastScreenshotHash = '';
+  let currentUrl = targetUrl; // Track current page URL
+  let actionHistory: string[] = []; // Track all actions taken
 
-  while (!isDone) {
+  // Build Puppeteer script for browser automation
+  const browserlessUrl = `https://production-sfo.browserless.io/chrome?token=${browserlessKey}`;
+
+  while (!isDone && iterationCount < MAX_ITERATIONS) {
     iterationCount++;
-    
-    // Safety check: Step limit
-    if (iterationCount > MAX_ITERATIONS) {
-      throw new Error('Agent exceeded the maximum step limit without completing the task');
-    }
-    
-    console.log(`Iteration ${iterationCount}: Taking screenshot of ${currentUrl}`);
+    console.log(`Iteration ${iterationCount}/${MAX_ITERATIONS}`);
 
-    // Update agent thought
     await supabase
       .from('tasks')
-      .update({ agent_thought: `Taking screenshot of ${currentUrl}...` })
+      .update({ agent_thought: `Step ${iterationCount}: Analyzing page...` })
       .eq('id', taskId);
 
-    // Capture screenshot
-    const screenshotResponse = await fetch(browserlessUrl, {
+    // Build script to replay all actions and capture current state
+    const stateScript = `
+      const browser = await puppeteer.launch();
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1280, height: 720 });
+      
+      try {
+        console.log("Navigating to ${targetUrl}");
+        await page.goto("${targetUrl}", { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.waitForTimeout(3000); // Wait for page to render
+        
+        // Replay all previous actions to restore state
+        ${actionHistory.map(action => action).join('\n        ')}
+        
+        // Get current page info
+        const pageInfo = await page.evaluate(() => ({
+          url: window.location.href,
+          title: document.title,
+          bodyText: document.body?.innerText?.substring(0, 500) || ''
+        }));
+        
+        // Take screenshot
+        const screenshot = await page.screenshot({ 
+          type: 'png',
+          fullPage: false 
+        });
+        
+        await browser.close();
+        
+        return {
+          screenshot: screenshot.toString('base64'),
+          pageInfo
+        };
+      } catch (error) {
+        console.error("Script error:", error);
+        await browser.close();
+        throw error;
+      }
+    `;
+
+    const scriptResponse = await fetch(browserlessUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        url: currentUrl,
-        options: {
-          fullPage: false,
-          type: 'png',
-        },
+        code: stateScript,
       }),
     });
 
-    if (!screenshotResponse.ok) {
-      throw new Error('Failed to capture screenshot');
+    if (!scriptResponse.ok) {
+      const errorText = await scriptResponse.text();
+      console.error('Browserless error:', errorText);
+      
+      // If first navigation fails, try one more time
+      if (iterationCount === 1) {
+        console.log('Retrying navigation...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue;
+      }
+      throw new Error('Failed to execute browser automation');
     }
 
-    const screenshotBuffer = await screenshotResponse.arrayBuffer();
-    const base64Screenshot = btoa(String.fromCharCode(...new Uint8Array(screenshotBuffer)));
+    const scriptResult = await scriptResponse.json();
+    const base64Screenshot = scriptResult.screenshot;
+    const pageInfo = scriptResult.pageInfo;
     
-    // Create a simple hash of the screenshot for comparison
-    const currentScreenshotHash = base64Screenshot.substring(0, 100);
+    console.log('Page info:', pageInfo);
 
-    // Update agent thought
-    await supabase
-      .from('tasks')
-      .update({ agent_thought: 'Analyzing screenshot...' })
-      .eq('id', taskId);
+    // Check for identical screenshots (page not loading or stuck)
+    const currentScreenshotHash = base64Screenshot.substring(0, 200);
+    if (currentScreenshotHash === lastScreenshotHash) {
+      identicalScreenshotCount++;
+      console.log(`Identical screenshot detected (${identicalScreenshotCount}/3)`);
+      
+      if (identicalScreenshotCount >= 3) {
+        // Refresh page once and reset counter
+        console.log('Refreshing page due to identical screenshots');
+        await fetch(browserlessUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: `
+              const browser = await puppeteer.launch();
+              const page = await browser.newPage();
+              await page.goto("${pageInfo.url}", { waitUntil: 'networkidle2' });
+              await page.reload({ waitUntil: 'networkidle2' });
+              await page.waitForTimeout(3000);
+              await browser.close();
+            `,
+          }),
+        });
+        identicalScreenshotCount = 0;
+        lastScreenshotHash = '';
+        continue;
+      }
+      
+      // Wait and retry
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      lastScreenshotHash = currentScreenshotHash;
+      continue;
+    }
+    
+    lastScreenshotHash = currentScreenshotHash;
+    identicalScreenshotCount = 0;
 
     // Ask Gemini to analyze and determine next action
+    await supabase
+      .from('tasks')
+      .update({ agent_thought: 'Analyzing page and planning next action...' })
+      .eq('id', taskId);
+
     const analysisResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -271,37 +323,50 @@ Example: "Go to eventbrite.com and search for tech conferences" -> execution_goa
       body: JSON.stringify({
         model: 'google/gemini-2.5-pro',
         messages: [
-        {
-          role: 'system',
-          content: `You are a web automation agent. You have already navigated to the target website. Now analyze the screenshot and determine the next action to achieve the user's goal.
+          {
+            role: 'system',
+            content: `You are a web automation agent. Analyze the screenshot and page info, then decide the next action.
 
-IMPORTANT: Respond ONLY with a valid JSON object in this exact format:
+IMPORTANT: Respond ONLY with a valid JSON object:
 {
-  "thought": "Your reasoning about what you see and what to do next",
+  "thought": "Your reasoning",
   "action": {
     "type": "click|type|scroll|done",
-    "selector": "CSS selector (for click/type actions)",
+    "selector": "CSS selector (for click/type)",
     "text": "Text to type (for type action)",
-    "raw_result": "The extracted data (ONLY for done action)"
+    "summary": "Human-readable summary (for done action)"
   }
 }
 
-Action types (NOTE: You are already on the correct page, do NOT use navigate):
-- click: Click an element (provide CSS selector)
-- type: Type text into an input (provide CSS selector and text)
-- scroll: Scroll the page
-- done: Goal achieved, provide the extracted data in raw_result
+Action types:
+- click: Click an element (provide CSS selector like "button", "input[type='text']", "#id", ".class")
+- type: Type text (provide selector and text)
+- scroll: Scroll down to load more content
+- done: Task completed - provide a clear, human-readable summary
 
-Current iteration: ${iterationCount}/${MAX_ITERATIONS}
-WARNING: You are approaching the step limit. Work efficiently to complete the goal.`
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `You are currently on: ${currentUrl}\n\nYour task: "${executionGoal}"\n\nWhat should I do next? Respond with JSON only.`
-            },
+CRITICAL RULES:
+1. For searches: Find the search input box and type the query
+2. For reading: Extract the page title and first paragraph
+3. For search results: List the top 3 result titles
+4. Never repeat the same action twice unless the page changes
+5. If stuck, try scrolling or mark as done with what you found
+6. Always return human-readable summaries, not raw HTML
+
+You are on step ${iterationCount}/${MAX_ITERATIONS}. Work efficiently.`
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `Current URL: ${pageInfo.url}
+Title: ${pageInfo.title}
+Task: "${executionGoal}"
+
+Page text preview: ${pageInfo.bodyText}
+
+What should I do next?`
+              },
               {
                 type: 'image_url',
                 image_url: {
@@ -318,58 +383,89 @@ WARNING: You are approaching the step limit. Work efficiently to complete the go
     if (!analysisResponse.ok) {
       const errorText = await analysisResponse.text();
       console.error('Gemini API error:', errorText);
-      throw new Error(`Failed to analyze screenshot: ${errorText}`);
+      throw new Error('Failed to analyze page');
     }
 
     const analysisData = await analysisResponse.json();
     let responseContent = analysisData.choices[0].message.content;
 
-    // Extract JSON from response (handle markdown code blocks)
     const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/) || 
                      responseContent.match(/(\{[\s\S]*\})/);
     
     if (!jsonMatch) {
-      console.error('Failed to parse JSON from response:', responseContent);
-      throw new Error('Agent returned invalid response format');
+      console.error('Invalid response:', responseContent);
+      throw new Error('Agent returned invalid response');
     }
 
     const agentResponse = JSON.parse(jsonMatch[1]);
-    console.log("Agent response:", agentResponse);
+    console.log("Agent decision:", agentResponse);
 
-    // Update agent thought
     await supabase
       .from('tasks')
       .update({ agent_thought: agentResponse.thought })
       .eq('id', taskId);
 
-    // Execute the action
     const action = agentResponse.action;
     
-    // Safety check: Repetition detection
+    // Check for repetitive actions
     if (previousAction && 
-        JSON.stringify(previousAction) === JSON.stringify(action) &&
-        previousScreenshotHash === currentScreenshotHash) {
-      throw new Error('Agent got stuck in a repetitive loop - same action with no page changes detected');
+        JSON.stringify(previousAction) === JSON.stringify(action)) {
+      console.log('Same action repeated, marking as done');
+      isDone = true;
+      rawResult = action.summary || 'Task completed but agent got stuck repeating actions';
+      break;
     }
     
-    // Update tracking variables
     previousAction = { ...action };
-    previousScreenshotHash = currentScreenshotHash;
 
+    // Execute action
     if (action.type === 'done') {
       isDone = true;
-      rawResult = action.raw_result || '';
-      console.log("Agent completed task with result:", rawResult);
-    } else if (action.type === 'click') {
-      console.log("Would click:", action.selector);
-      // Note: Browserless screenshot API doesn't support interactions
-      // In a real implementation, you'd use Puppeteer or Playwright
-    } else if (action.type === 'type') {
-      console.log("Would type:", action.text, "into", action.selector);
-      // Note: Same limitation as click
-    } else if (action.type === 'scroll') {
-      console.log("Would scroll the page");
-      // Note: Same limitation as click
+      rawResult = action.summary || '';
+      console.log("Task completed:", rawResult);
+    } else {
+      // Add action to history for replay on next iteration
+      let actionCode = '';
+      
+      if (action.type === 'click') {
+        console.log("Clicking:", action.selector);
+        const safeSelector = action.selector.replace(/'/g, "\\'");
+        actionCode = `
+        console.log("Clicking: ${safeSelector}");
+        try {
+          await page.waitForSelector('${safeSelector}', { timeout: 10000 });
+          await page.click('${safeSelector}');
+          await page.waitForTimeout(2000);
+        } catch (e) {
+          console.log("Click failed, continuing:", e.message);
+        }`;
+      } else if (action.type === 'type') {
+        console.log("Typing:", action.text, "into", action.selector);
+        const safeSelector = action.selector.replace(/'/g, "\\'");
+        const safeText = action.text.replace(/'/g, "\\'").replace(/\n/g, '\\n');
+        actionCode = `
+        console.log("Typing into: ${safeSelector}");
+        try {
+          await page.waitForSelector('${safeSelector}', { timeout: 10000 });
+          await page.click('${safeSelector}'); // Focus the input
+          await page.type('${safeSelector}', '${safeText}');
+          await page.keyboard.press('Enter'); // Submit the form
+          await page.waitForTimeout(2000);
+        } catch (e) {
+          console.log("Type failed, continuing:", e.message);
+        }`;
+      } else if (action.type === 'scroll') {
+        console.log("Scrolling page");
+        actionCode = `
+        console.log("Scrolling page");
+        await page.evaluate(() => window.scrollBy(0, 500));
+        await page.waitForTimeout(1000);`;
+      }
+
+      if (actionCode) {
+        actionHistory.push(actionCode);
+        currentUrl = pageInfo.url; // Update current URL
+      }
     }
 
     // Small delay between iterations
