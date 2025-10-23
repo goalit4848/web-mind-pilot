@@ -116,7 +116,7 @@ async function executeAgentLoop(
   lovableKey: string,
   supabase: any
 ) {
-  console.log("Starting simple web automation for prompt:", prompt);
+  console.log("Starting web automation for prompt:", prompt);
   
   // PHASE 1: URL EXTRACTION
   console.log("Phase 1: Extracting target URL from prompt");
@@ -136,10 +136,9 @@ async function executeAgentLoop(
       messages: [
         {
           role: 'system',
-          content: `Extract the target URL and task from the user's request. Respond ONLY with JSON:
+          content: `Extract the target URL from the user's request. Respond ONLY with JSON:
 {
-  "url": "https://example.com",
-  "task": "what to do on this website"
+  "url": "https://example.com"
 }`
         },
         {
@@ -153,7 +152,7 @@ async function executeAgentLoop(
 
   if (!urlExtractionResponse.ok) {
     return { 
-      summary: "I couldn't understand the URL from your request. Please specify a valid website like google.com or example.com.",
+      summary: "I couldn't understand the URL from your request. Please specify a valid website.",
       rawResult: null
     };
   }
@@ -164,119 +163,79 @@ async function executeAgentLoop(
   
   if (!urlMatch) {
     return { 
-      summary: "I couldn't parse the website URL from your request. Please specify a clear URL.",
+      summary: "I couldn't parse the website URL from your request.",
       rawResult: null
     };
   }
 
-  const { url: targetUrl, task: executionTask } = JSON.parse(urlMatch[0]);
-  console.log("Target URL:", targetUrl, "Task:", executionTask);
+  const { url: targetUrl } = JSON.parse(urlMatch[0]);
+  console.log("Target URL:", targetUrl);
 
   await supabase
     .from('tasks')
     .update({ agent_thought: `Visiting ${targetUrl}...` })
     .eq('id', taskId);
 
-  // PHASE 2: VISIT AND READ THE PAGE
+  // PHASE 2: VISIT THE PAGE WITH SMART RETRIES
   console.log("Phase 2: Visiting the page");
   
-  const browserlessUrl = `https://production-sfo.browserless.io/chrome?token=${browserlessKey}`;
+  const browserlessUrl = `https://chrome.browserless.io/content?token=${browserlessKey}`;
+  const MAX_RETRIES = 2;
+  let attempt = 0;
+  let pageContent = null;
 
-  // Simple script: navigate, wait, screenshot, extract text
-  const visitScript = `
-    const browser = await puppeteer.launch();
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
-    
-    try {
-      console.log("Navigating to ${targetUrl}");
-      await page.goto("${targetUrl}", { waitUntil: 'networkidle2', timeout: 30000 });
-      
-      // Wait 3 seconds for page to fully render
-      await page.waitForTimeout(3000);
-      
-      // Get page info
-      const pageInfo = await page.evaluate(() => {
-        // Extract visible text from the page
-        const getVisibleText = () => {
-          const bodyText = document.body?.innerText || '';
-          const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
-            .map(h => h.textContent?.trim())
-            .filter(t => t)
-            .slice(0, 5);
-          
-          return {
-            title: document.title,
-            headings: headings,
-            firstParagraph: bodyText.split('\\n').filter(line => line.length > 50)[0] || bodyText.substring(0, 300),
-            fullText: bodyText.substring(0, 2000)
-          };
-        };
-        
-        return {
-          url: window.location.href,
-          ...getVisibleText()
-        };
-      });
-      
-      // Take screenshot
-      const screenshot = await page.screenshot({ 
-        type: 'png',
-        fullPage: false 
-      });
-      
-      await browser.close();
-      
-      return {
-        screenshot: screenshot.toString('base64'),
-        pageInfo
-      };
-    } catch (error) {
-      console.error("Navigation error:", error);
-      await browser.close();
-      throw error;
+  while (attempt <= MAX_RETRIES && !pageContent) {
+    if (attempt > 0) {
+      console.log(`Retry attempt ${attempt}/${MAX_RETRIES}`);
+      await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay between retries
     }
-  `;
 
-  let scriptResponse;
-  try {
-    scriptResponse = await fetch(browserlessUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: visitScript }),
-    });
-  } catch (error) {
-    console.error('Browserless fetch error:', error);
-    return { 
-      summary: "The page didn't load correctly. The website may be down or unreachable.",
-      rawResult: null
-    };
+    try {
+      const browserlessResponse = await fetch(browserlessUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: targetUrl,
+          gotoOptions: { 
+            waitUntil: 'networkidle0', 
+            timeout: 40000 
+          },
+          waitForTimeout: 3000,
+          elements: [
+            { selector: 'title', action: 'text' },
+            { selector: 'h1', action: 'text' },
+            { selector: 'h2', action: 'text' },
+            { selector: 'p', action: 'text' }
+          ]
+        }),
+      });
+
+      if (!browserlessResponse.ok) {
+        const errorText = await browserlessResponse.text();
+        console.error(`Browserless error (attempt ${attempt + 1}):`, errorText);
+        attempt++;
+        continue;
+      }
+
+      const data = await browserlessResponse.json();
+      
+      // Check if we got meaningful content
+      if (data && (data.data || data.html || data.elements)) {
+        pageContent = data;
+        console.log('Page loaded successfully');
+      } else {
+        console.log('Page returned empty content, retrying...');
+        attempt++;
+      }
+    } catch (error) {
+      console.error(`Fetch error (attempt ${attempt + 1}):`, error);
+      attempt++;
+    }
   }
 
-  if (!scriptResponse.ok) {
-    const errorText = await scriptResponse.text();
-    console.error('Browserless error:', errorText);
+  if (!pageContent) {
     return { 
-      summary: "The page didn't load correctly. The website may have blocked the request or timed out.",
-      rawResult: null
-    };
-  }
-
-  const scriptResult = await scriptResponse.json();
-  const base64Screenshot = scriptResult.screenshot;
-  const pageInfo = scriptResult.pageInfo;
-  
-  console.log('Page loaded successfully:', pageInfo.title);
-
-  // Check if screenshot is likely black/empty
-  const isLikelyBlack = base64Screenshot.substring(0, 500).split('').filter((c: string, i: number, arr: string[]) => 
-    i > 0 && c !== arr[i-1]
-  ).length < 10;
-  
-  if (isLikelyBlack) {
-    console.log('Screenshot appears black or empty');
-    return { 
-      summary: "The page didn't load correctly. I could navigate to it, but the content didn't render properly.",
+      summary: "The page didn't load after retries.",
       rawResult: null
     };
   }
@@ -287,6 +246,33 @@ async function executeAgentLoop(
     .update({ agent_thought: 'Reading the page content...' })
     .eq('id', taskId);
 
+  // Extract text from elements
+  const extractedText: {
+    title: string;
+    headings: string[];
+    paragraphs: string[];
+  } = {
+    title: '',
+    headings: [],
+    paragraphs: []
+  };
+
+  if (pageContent.elements) {
+    pageContent.elements.forEach((el: any) => {
+      if (el.selector === 'title' && el.text) {
+        extractedText.title = el.text.trim();
+      } else if ((el.selector === 'h1' || el.selector === 'h2') && el.text) {
+        extractedText.headings.push(el.text.trim());
+      } else if (el.selector === 'p' && el.text) {
+        extractedText.paragraphs.push(el.text.trim());
+      }
+    });
+  }
+
+  // Limit text for API call
+  const headingsText = extractedText.headings.slice(0, 5).join('\n');
+  const paragraphsText = extractedText.paragraphs.slice(0, 3).join('\n').substring(0, 1000);
+
   const analysisResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -294,15 +280,15 @@ async function executeAgentLoop(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'google/gemini-2.5-pro',
+      model: 'google/gemini-2.5-flash',
       messages: [
         {
           role: 'system',
-          content: `You are a web automation assistant. Your job is to read websites and summarize what you see in plain, human-readable language.
+          content: `You are a web automation assistant. Summarize what you see on web pages in plain, human-readable language.
 
 RULES:
 - Write like a human would describe what they see
-- For regular pages: mention the title and main content
+- For regular pages: mention the title and main content in 1-2 sentences
 - For search results: list the top 3-5 results with brief descriptions
 - Never output JSON, code, or HTML
 - Keep it conversational and clear
@@ -314,34 +300,20 @@ User asked to visit example.com:
 
 User asked to search Google for "AI tools":
 "I visited Google and searched for AI tools. Here are the top results:
-• FutureTools - A collection of the best AI tools and software
+• FutureTools - A collection of the best AI tools
 • Product Hunt AI - New AI tools and products
-• OpenAI - The creators of ChatGPT and GPT-4"`
+• OpenAI - The creators of ChatGPT"`
         },
         {
           role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `User asked: "${prompt}"
+          content: `User asked: "${prompt}"
 
-I visited: ${pageInfo.url}
-Page title: ${pageInfo.title}
-Main headings: ${pageInfo.headings.join(', ')}
-First paragraph: ${pageInfo.firstParagraph}
+I visited: ${targetUrl}
+Page title: ${extractedText.title || 'Unknown'}
+Main headings: ${headingsText || 'None found'}
+First paragraphs: ${paragraphsText || 'None found'}
 
-Full page text preview:
-${pageInfo.fullText}
-
-Please provide a clear, human-readable summary of what you found.`
-            },
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:image/png;base64,${base64Screenshot}`
-              }
-            }
-          ]
+Please provide a clear, human-readable summary.`
         }
       ],
       max_tokens: 500,
@@ -352,9 +324,10 @@ Please provide a clear, human-readable summary of what you found.`
     const errorText = await analysisResponse.text();
     console.error('Gemini API error:', errorText);
     // Fallback to basic summary
+    const firstParagraph = extractedText.paragraphs[0] || 'No content found';
     return {
-      summary: `I visited ${pageInfo.title || targetUrl}. ${pageInfo.firstParagraph}`,
-      rawResult: JSON.stringify(pageInfo)
+      summary: `I visited ${extractedText.title || targetUrl}. ${firstParagraph.substring(0, 200)}`,
+      rawResult: JSON.stringify(extractedText)
     };
   }
 
@@ -365,6 +338,6 @@ Please provide a clear, human-readable summary of what you found.`
 
   return { 
     summary, 
-    rawResult: JSON.stringify(pageInfo) 
+    rawResult: JSON.stringify(extractedText) 
   };
 }
